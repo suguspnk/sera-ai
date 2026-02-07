@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { RunEmbeddedPiAgentParams } from "./run/params.js";
 import type { EmbeddedPiAgentMeta, EmbeddedPiRunResult } from "./types.js";
-import { enqueueCommandInLane } from "../../process/command-queue.js";
+import { enqueueCommandInLane, enqueueSessionTask } from "../../process/command-queue.js";
 import { isMarkdownCapableMessageChannel } from "../../utils/message-channel.js";
 import { resolveOpenClawAgentDir } from "../agent-paths.js";
 import {
@@ -47,7 +47,7 @@ import {
 import { derivePromptTokens, normalizeUsage, type UsageLike } from "../usage.js";
 import { redactRunIdentifier, resolveRunWorkspaceDir } from "../workspace-run.js";
 import { compactEmbeddedPiSessionDirect } from "./compact.js";
-import { resolveGlobalLane, resolveSessionLane } from "./lanes.js";
+import { resolveGlobalLane, resolveRunPriority } from "./lanes.js";
 import { log } from "./logger.js";
 import { resolveModel } from "./model.js";
 import { runEmbeddedAttempt } from "./run/attempt.js";
@@ -158,12 +158,19 @@ const toNormalizedUsage = (usage: UsageAccumulator) => {
 export async function runEmbeddedPiAgent(
   params: RunEmbeddedPiAgentParams,
 ): Promise<EmbeddedPiRunResult> {
-  const sessionLane = resolveSessionLane(params.sessionKey?.trim() || params.sessionId);
+  const sessionKey = params.sessionKey?.trim() || params.sessionId;
   const globalLane = resolveGlobalLane(params.lane);
-  const enqueueGlobal =
-    params.enqueue ?? ((task, opts) => enqueueCommandInLane(globalLane, task, opts));
-  const enqueueSession =
-    params.enqueue ?? ((task, opts) => enqueueCommandInLane(sessionLane, task, opts));
+
+  // Resolve priority from context hints
+  const priority = resolveRunPriority({
+    priority: params.priority,
+    isHeartbeat: params.isHeartbeat,
+    isCron: params.isCron,
+    isSubagent: params.isSubagent,
+    isMention: params.isMention,
+    isReply: params.isReply,
+  });
+
   const channelHint = params.messageChannel ?? params.messageProvider;
   const resolvedToolResultFormat =
     params.toolResultFormat ??
@@ -174,235 +181,234 @@ export async function runEmbeddedPiAgent(
       : "markdown");
   const isProbeSession = params.sessionId?.startsWith("probe-") ?? false;
 
-  return enqueueSession(() =>
-    enqueueGlobal(async () => {
-      const started = Date.now();
-      const workspaceResolution = resolveRunWorkspaceDir({
-        workspaceDir: params.workspaceDir,
-        sessionKey: params.sessionKey,
-        agentId: params.agentId,
-        config: params.config,
-      });
-      const resolvedWorkspace = workspaceResolution.workspaceDir;
-      const redactedSessionId = redactRunIdentifier(params.sessionId);
-      const redactedSessionKey = redactRunIdentifier(params.sessionKey);
-      const redactedWorkspace = redactRunIdentifier(resolvedWorkspace);
-      if (workspaceResolution.usedFallback) {
-        log.warn(
-          `[workspace-fallback] caller=runEmbeddedPiAgent reason=${workspaceResolution.fallbackReason} run=${params.runId} session=${redactedSessionId} sessionKey=${redactedSessionKey} agent=${workspaceResolution.agentId} workspace=${redactedWorkspace}`,
-        );
-      }
-      const prevCwd = process.cwd();
-
-      const provider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
-      const modelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
-      const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
-      const fallbackConfigured =
-        (params.config?.agents?.defaults?.model?.fallbacks?.length ?? 0) > 0;
-      await ensureOpenClawModelsJson(params.config, agentDir);
-
-      const { model, error, authStorage, modelRegistry } = resolveModel(
-        provider,
-        modelId,
-        agentDir,
-        params.config,
+  // Use session-based queue if we have a session key (per-session isolation)
+  // Otherwise fall back to global lane (backward compatibility)
+  const runTask = async () => {
+    const started = Date.now();
+    const workspaceResolution = resolveRunWorkspaceDir({
+      workspaceDir: params.workspaceDir,
+      sessionKey: params.sessionKey,
+      agentId: params.agentId,
+      config: params.config,
+    });
+    const resolvedWorkspace = workspaceResolution.workspaceDir;
+    const redactedSessionId = redactRunIdentifier(params.sessionId);
+    const redactedSessionKey = redactRunIdentifier(params.sessionKey);
+    const redactedWorkspace = redactRunIdentifier(resolvedWorkspace);
+    if (workspaceResolution.usedFallback) {
+      log.warn(
+        `[workspace-fallback] caller=runEmbeddedPiAgent reason=${workspaceResolution.fallbackReason} run=${params.runId} session=${redactedSessionId} sessionKey=${redactedSessionKey} agent=${workspaceResolution.agentId} workspace=${redactedWorkspace}`,
       );
-      if (!model) {
-        throw new Error(error ?? `Unknown model: ${provider}/${modelId}`);
-      }
+    }
+    const prevCwd = process.cwd();
 
-      const ctxInfo = resolveContextWindowInfo({
-        cfg: params.config,
-        provider,
-        modelId,
-        modelContextWindow: model.contextWindow,
-        defaultTokens: DEFAULT_CONTEXT_TOKENS,
-      });
-      const ctxGuard = evaluateContextWindowGuard({
-        info: ctxInfo,
-        warnBelowTokens: CONTEXT_WINDOW_WARN_BELOW_TOKENS,
-        hardMinTokens: CONTEXT_WINDOW_HARD_MIN_TOKENS,
-      });
-      if (ctxGuard.shouldWarn) {
-        log.warn(
-          `low context window: ${provider}/${modelId} ctx=${ctxGuard.tokens} (warn<${CONTEXT_WINDOW_WARN_BELOW_TOKENS}) source=${ctxGuard.source}`,
-        );
-      }
-      if (ctxGuard.shouldBlock) {
-        log.error(
-          `blocked model (context window too small): ${provider}/${modelId} ctx=${ctxGuard.tokens} (min=${CONTEXT_WINDOW_HARD_MIN_TOKENS}) source=${ctxGuard.source}`,
-        );
-        throw new FailoverError(
-          `Model context window too small (${ctxGuard.tokens} tokens). Minimum is ${CONTEXT_WINDOW_HARD_MIN_TOKENS}.`,
-          { reason: "unknown", provider, model: modelId },
-        );
-      }
+    const provider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
+    const modelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+    const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
+    const fallbackConfigured = (params.config?.agents?.defaults?.model?.fallbacks?.length ?? 0) > 0;
+    await ensureOpenClawModelsJson(params.config, agentDir);
 
-      const authStore = ensureAuthProfileStore(agentDir, { allowKeychainPrompt: false });
-      const preferredProfileId = params.authProfileId?.trim();
-      let lockedProfileId = params.authProfileIdSource === "user" ? preferredProfileId : undefined;
-      if (lockedProfileId) {
-        const lockedProfile = authStore.profiles[lockedProfileId];
-        if (
-          !lockedProfile ||
-          normalizeProviderId(lockedProfile.provider) !== normalizeProviderId(provider)
-        ) {
-          lockedProfileId = undefined;
-        }
+    const { model, error, authStorage, modelRegistry } = resolveModel(
+      provider,
+      modelId,
+      agentDir,
+      params.config,
+    );
+    if (!model) {
+      throw new Error(error ?? `Unknown model: ${provider}/${modelId}`);
+    }
+
+    const ctxInfo = resolveContextWindowInfo({
+      cfg: params.config,
+      provider,
+      modelId,
+      modelContextWindow: model.contextWindow,
+      defaultTokens: DEFAULT_CONTEXT_TOKENS,
+    });
+    const ctxGuard = evaluateContextWindowGuard({
+      info: ctxInfo,
+      warnBelowTokens: CONTEXT_WINDOW_WARN_BELOW_TOKENS,
+      hardMinTokens: CONTEXT_WINDOW_HARD_MIN_TOKENS,
+    });
+    if (ctxGuard.shouldWarn) {
+      log.warn(
+        `low context window: ${provider}/${modelId} ctx=${ctxGuard.tokens} (warn<${CONTEXT_WINDOW_WARN_BELOW_TOKENS}) source=${ctxGuard.source}`,
+      );
+    }
+    if (ctxGuard.shouldBlock) {
+      log.error(
+        `blocked model (context window too small): ${provider}/${modelId} ctx=${ctxGuard.tokens} (min=${CONTEXT_WINDOW_HARD_MIN_TOKENS}) source=${ctxGuard.source}`,
+      );
+      throw new FailoverError(
+        `Model context window too small (${ctxGuard.tokens} tokens). Minimum is ${CONTEXT_WINDOW_HARD_MIN_TOKENS}.`,
+        { reason: "unknown", provider, model: modelId },
+      );
+    }
+
+    const authStore = ensureAuthProfileStore(agentDir, { allowKeychainPrompt: false });
+    const preferredProfileId = params.authProfileId?.trim();
+    let lockedProfileId = params.authProfileIdSource === "user" ? preferredProfileId : undefined;
+    if (lockedProfileId) {
+      const lockedProfile = authStore.profiles[lockedProfileId];
+      if (
+        !lockedProfile ||
+        normalizeProviderId(lockedProfile.provider) !== normalizeProviderId(provider)
+      ) {
+        lockedProfileId = undefined;
       }
-      const profileOrder = resolveAuthProfileOrder({
+    }
+    const profileOrder = resolveAuthProfileOrder({
+      cfg: params.config,
+      store: authStore,
+      provider,
+      preferredProfile: preferredProfileId,
+    });
+    if (lockedProfileId && !profileOrder.includes(lockedProfileId)) {
+      throw new Error(`Auth profile "${lockedProfileId}" is not configured for ${provider}.`);
+    }
+    const profileCandidates = lockedProfileId
+      ? [lockedProfileId]
+      : profileOrder.length > 0
+        ? profileOrder
+        : [undefined];
+    let profileIndex = 0;
+
+    const initialThinkLevel = params.thinkLevel ?? "off";
+    let thinkLevel = initialThinkLevel;
+    const attemptedThinking = new Set<ThinkLevel>();
+    let apiKeyInfo: ApiKeyInfo | null = null;
+    let lastProfileId: string | undefined;
+
+    const resolveAuthProfileFailoverReason = (params: {
+      allInCooldown: boolean;
+      message: string;
+    }): FailoverReason => {
+      if (params.allInCooldown) {
+        return "rate_limit";
+      }
+      const classified = classifyFailoverReason(params.message);
+      return classified ?? "auth";
+    };
+
+    const throwAuthProfileFailover = (params: {
+      allInCooldown: boolean;
+      message?: string;
+      error?: unknown;
+    }): never => {
+      const fallbackMessage = `No available auth profile for ${provider} (all in cooldown or unavailable).`;
+      const message =
+        params.message?.trim() ||
+        (params.error ? describeUnknownError(params.error).trim() : "") ||
+        fallbackMessage;
+      const reason = resolveAuthProfileFailoverReason({
+        allInCooldown: params.allInCooldown,
+        message,
+      });
+      if (fallbackConfigured) {
+        throw new FailoverError(message, {
+          reason,
+          provider,
+          model: modelId,
+          status: resolveFailoverStatus(reason),
+          cause: params.error,
+        });
+      }
+      if (params.error instanceof Error) {
+        throw params.error;
+      }
+      throw new Error(message);
+    };
+
+    const resolveApiKeyForCandidate = async (candidate?: string) => {
+      return getApiKeyForModel({
+        model,
         cfg: params.config,
+        profileId: candidate,
         store: authStore,
-        provider,
-        preferredProfile: preferredProfileId,
+        agentDir,
       });
-      if (lockedProfileId && !profileOrder.includes(lockedProfileId)) {
-        throw new Error(`Auth profile "${lockedProfileId}" is not configured for ${provider}.`);
+    };
+
+    const applyApiKeyInfo = async (candidate?: string): Promise<void> => {
+      apiKeyInfo = await resolveApiKeyForCandidate(candidate);
+      const resolvedProfileId = apiKeyInfo.profileId ?? candidate;
+      if (!apiKeyInfo.apiKey) {
+        if (apiKeyInfo.mode !== "aws-sdk") {
+          throw new Error(
+            `No API key resolved for provider "${model.provider}" (auth mode: ${apiKeyInfo.mode}).`,
+          );
+        }
+        lastProfileId = resolvedProfileId;
+        return;
       }
-      const profileCandidates = lockedProfileId
-        ? [lockedProfileId]
-        : profileOrder.length > 0
-          ? profileOrder
-          : [undefined];
-      let profileIndex = 0;
-
-      const initialThinkLevel = params.thinkLevel ?? "off";
-      let thinkLevel = initialThinkLevel;
-      const attemptedThinking = new Set<ThinkLevel>();
-      let apiKeyInfo: ApiKeyInfo | null = null;
-      let lastProfileId: string | undefined;
-
-      const resolveAuthProfileFailoverReason = (params: {
-        allInCooldown: boolean;
-        message: string;
-      }): FailoverReason => {
-        if (params.allInCooldown) {
-          return "rate_limit";
-        }
-        const classified = classifyFailoverReason(params.message);
-        return classified ?? "auth";
-      };
-
-      const throwAuthProfileFailover = (params: {
-        allInCooldown: boolean;
-        message?: string;
-        error?: unknown;
-      }): never => {
-        const fallbackMessage = `No available auth profile for ${provider} (all in cooldown or unavailable).`;
-        const message =
-          params.message?.trim() ||
-          (params.error ? describeUnknownError(params.error).trim() : "") ||
-          fallbackMessage;
-        const reason = resolveAuthProfileFailoverReason({
-          allInCooldown: params.allInCooldown,
-          message,
+      if (model.provider === "github-copilot") {
+        const { resolveCopilotApiToken } = await import("../../providers/github-copilot-token.js");
+        const copilotToken = await resolveCopilotApiToken({
+          githubToken: apiKeyInfo.apiKey,
         });
-        if (fallbackConfigured) {
-          throw new FailoverError(message, {
-            reason,
-            provider,
-            model: modelId,
-            status: resolveFailoverStatus(reason),
-            cause: params.error,
-          });
-        }
-        if (params.error instanceof Error) {
-          throw params.error;
-        }
-        throw new Error(message);
-      };
+        authStorage.setRuntimeApiKey(model.provider, copilotToken.token);
+      } else {
+        authStorage.setRuntimeApiKey(model.provider, apiKeyInfo.apiKey);
+      }
+      lastProfileId = apiKeyInfo.profileId;
+    };
 
-      const resolveApiKeyForCandidate = async (candidate?: string) => {
-        return getApiKeyForModel({
-          model,
-          cfg: params.config,
-          profileId: candidate,
-          store: authStore,
-          agentDir,
-        });
-      };
-
-      const applyApiKeyInfo = async (candidate?: string): Promise<void> => {
-        apiKeyInfo = await resolveApiKeyForCandidate(candidate);
-        const resolvedProfileId = apiKeyInfo.profileId ?? candidate;
-        if (!apiKeyInfo.apiKey) {
-          if (apiKeyInfo.mode !== "aws-sdk") {
-            throw new Error(
-              `No API key resolved for provider "${model.provider}" (auth mode: ${apiKeyInfo.mode}).`,
-            );
-          }
-          lastProfileId = resolvedProfileId;
-          return;
-        }
-        if (model.provider === "github-copilot") {
-          const { resolveCopilotApiToken } =
-            await import("../../providers/github-copilot-token.js");
-          const copilotToken = await resolveCopilotApiToken({
-            githubToken: apiKeyInfo.apiKey,
-          });
-          authStorage.setRuntimeApiKey(model.provider, copilotToken.token);
-        } else {
-          authStorage.setRuntimeApiKey(model.provider, apiKeyInfo.apiKey);
-        }
-        lastProfileId = apiKeyInfo.profileId;
-      };
-
-      const advanceAuthProfile = async (): Promise<boolean> => {
-        if (lockedProfileId) {
-          return false;
-        }
-        let nextIndex = profileIndex + 1;
-        while (nextIndex < profileCandidates.length) {
-          const candidate = profileCandidates[nextIndex];
-          if (candidate && isProfileInCooldown(authStore, candidate)) {
-            nextIndex += 1;
-            continue;
-          }
-          try {
-            await applyApiKeyInfo(candidate);
-            profileIndex = nextIndex;
-            thinkLevel = initialThinkLevel;
-            attemptedThinking.clear();
-            return true;
-          } catch (err) {
-            if (candidate && candidate === lockedProfileId) {
-              throw err;
-            }
-            nextIndex += 1;
-          }
-        }
+    const advanceAuthProfile = async (): Promise<boolean> => {
+      if (lockedProfileId) {
         return false;
-      };
-
-      try {
-        while (profileIndex < profileCandidates.length) {
-          const candidate = profileCandidates[profileIndex];
-          if (
-            candidate &&
-            candidate !== lockedProfileId &&
-            isProfileInCooldown(authStore, candidate)
-          ) {
-            profileIndex += 1;
-            continue;
+      }
+      let nextIndex = profileIndex + 1;
+      while (nextIndex < profileCandidates.length) {
+        const candidate = profileCandidates[nextIndex];
+        if (candidate && isProfileInCooldown(authStore, candidate)) {
+          nextIndex += 1;
+          continue;
+        }
+        try {
+          await applyApiKeyInfo(candidate);
+          profileIndex = nextIndex;
+          thinkLevel = initialThinkLevel;
+          attemptedThinking.clear();
+          return true;
+        } catch (err) {
+          if (candidate && candidate === lockedProfileId) {
+            throw err;
           }
-          await applyApiKeyInfo(profileCandidates[profileIndex]);
-          break;
-        }
-        if (profileIndex >= profileCandidates.length) {
-          throwAuthProfileFailover({ allInCooldown: true });
-        }
-      } catch (err) {
-        if (err instanceof FailoverError) {
-          throw err;
-        }
-        if (profileCandidates[profileIndex] === lockedProfileId) {
-          throwAuthProfileFailover({ allInCooldown: false, error: err });
-        }
-        const advanced = await advanceAuthProfile();
-        if (!advanced) {
-          throwAuthProfileFailover({ allInCooldown: false, error: err });
+          nextIndex += 1;
         }
       }
+      return false;
+    };
+
+    try {
+      while (profileIndex < profileCandidates.length) {
+        const candidate = profileCandidates[profileIndex];
+        if (
+          candidate &&
+          candidate !== lockedProfileId &&
+          isProfileInCooldown(authStore, candidate)
+        ) {
+          profileIndex += 1;
+          continue;
+        }
+        await applyApiKeyInfo(profileCandidates[profileIndex]);
+        break;
+      }
+      if (profileIndex >= profileCandidates.length) {
+        throwAuthProfileFailover({ allInCooldown: true });
+      }
+    } catch (err) {
+      if (err instanceof FailoverError) {
+        throw err;
+      }
+      if (profileCandidates[profileIndex] === lockedProfileId) {
+        throwAuthProfileFailover({ allInCooldown: false, error: err });
+      }
+      const advanced = await advanceAuthProfile();
+      if (!advanced) {
+        throwAuthProfileFailover({ allInCooldown: false, error: err });
+      }
+    }
 
       const MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3;
       let overflowCompactionAttempts = 0;
@@ -415,66 +421,65 @@ export async function runEmbeddedPiAgent(
           attemptedThinking.add(thinkLevel);
           await fs.mkdir(resolvedWorkspace, { recursive: true });
 
-          const prompt =
-            provider === "anthropic" ? scrubAnthropicRefusalMagic(params.prompt) : params.prompt;
+        const prompt =
+          provider === "anthropic" ? scrubAnthropicRefusalMagic(params.prompt) : params.prompt;
 
-          const attempt = await runEmbeddedAttempt({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            messageChannel: params.messageChannel,
-            messageProvider: params.messageProvider,
-            agentAccountId: params.agentAccountId,
-            messageTo: params.messageTo,
-            messageThreadId: params.messageThreadId,
-            groupId: params.groupId,
-            groupChannel: params.groupChannel,
-            groupSpace: params.groupSpace,
-            spawnedBy: params.spawnedBy,
-            senderIsOwner: params.senderIsOwner,
-            currentChannelId: params.currentChannelId,
-            currentThreadTs: params.currentThreadTs,
-            replyToMode: params.replyToMode,
-            hasRepliedRef: params.hasRepliedRef,
-            sessionFile: params.sessionFile,
-            workspaceDir: resolvedWorkspace,
-            agentDir,
-            config: params.config,
-            skillsSnapshot: params.skillsSnapshot,
-            prompt,
-            images: params.images,
-            disableTools: params.disableTools,
-            provider,
-            modelId,
-            model,
-            authStorage,
-            modelRegistry,
-            agentId: workspaceResolution.agentId,
-            thinkLevel,
-            verboseLevel: params.verboseLevel,
-            reasoningLevel: params.reasoningLevel,
-            toolResultFormat: resolvedToolResultFormat,
-            execOverrides: params.execOverrides,
-            bashElevated: params.bashElevated,
-            timeoutMs: params.timeoutMs,
-            runId: params.runId,
-            abortSignal: params.abortSignal,
-            shouldEmitToolResult: params.shouldEmitToolResult,
-            shouldEmitToolOutput: params.shouldEmitToolOutput,
-            onPartialReply: params.onPartialReply,
-            onAssistantMessageStart: params.onAssistantMessageStart,
-            onBlockReply: params.onBlockReply,
-            onBlockReplyFlush: params.onBlockReplyFlush,
-            blockReplyBreak: params.blockReplyBreak,
-            blockReplyChunking: params.blockReplyChunking,
-            onReasoningStream: params.onReasoningStream,
-            onToolResult: params.onToolResult,
-            onAgentEvent: params.onAgentEvent,
-            extraSystemPrompt: params.extraSystemPrompt,
-            inputProvenance: params.inputProvenance,
-            streamParams: params.streamParams,
-            ownerNumbers: params.ownerNumbers,
-            enforceFinalTag: params.enforceFinalTag,
-          });
+        const attempt = await runEmbeddedAttempt({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          messageChannel: params.messageChannel,
+          messageProvider: params.messageProvider,
+          agentAccountId: params.agentAccountId,
+          messageTo: params.messageTo,
+          messageThreadId: params.messageThreadId,
+          groupId: params.groupId,
+          groupChannel: params.groupChannel,
+          groupSpace: params.groupSpace,
+          spawnedBy: params.spawnedBy,
+          senderIsOwner: params.senderIsOwner,
+          currentChannelId: params.currentChannelId,
+          currentThreadTs: params.currentThreadTs,
+          replyToMode: params.replyToMode,
+          hasRepliedRef: params.hasRepliedRef,
+          sessionFile: params.sessionFile,
+          workspaceDir: resolvedWorkspace,
+          agentDir,
+          config: params.config,
+          skillsSnapshot: params.skillsSnapshot,
+          prompt,
+          images: params.images,
+          disableTools: params.disableTools,
+          provider,
+          modelId,
+          model,
+          authStorage,
+          modelRegistry,
+          agentId: workspaceResolution.agentId,
+          thinkLevel,
+          verboseLevel: params.verboseLevel,
+          reasoningLevel: params.reasoningLevel,
+          toolResultFormat: resolvedToolResultFormat,
+          execOverrides: params.execOverrides,
+          bashElevated: params.bashElevated,
+          timeoutMs: params.timeoutMs,
+          runId: params.runId,
+          abortSignal: params.abortSignal,
+          shouldEmitToolResult: params.shouldEmitToolResult,
+          shouldEmitToolOutput: params.shouldEmitToolOutput,
+          onPartialReply: params.onPartialReply,
+          onAssistantMessageStart: params.onAssistantMessageStart,
+          onBlockReply: params.onBlockReply,
+          onBlockReplyFlush: params.onBlockReplyFlush,
+          blockReplyBreak: params.blockReplyBreak,
+          blockReplyChunking: params.blockReplyChunking,
+          onReasoningStream: params.onReasoningStream,
+          onToolResult: params.onToolResult,
+          onAgentEvent: params.onAgentEvent,
+          extraSystemPrompt: params.extraSystemPrompt,
+          inputProvenance: params.inputProvenance,streamParams: params.streamParams,
+          ownerNumbers: params.ownerNumbers,
+          enforceFinalTag: params.enforceFinalTag,
+        });
 
           const { aborted, promptError, timedOut, sessionIdUsed, lastAssistant } = attempt;
           const lastAssistantUsage = normalizeUsage(lastAssistant?.usage as UsageLike);
@@ -718,110 +723,109 @@ export async function runEmbeddedPiAgent(
             throw promptError;
           }
 
-          const fallbackThinking = pickFallbackThinkingLevel({
-            message: lastAssistant?.errorMessage,
-            attempted: attemptedThinking,
-          });
-          if (fallbackThinking && !aborted) {
-            log.warn(
-              `unsupported thinking level for ${provider}/${modelId}; retrying with ${fallbackThinking}`,
-            );
-            thinkLevel = fallbackThinking;
+        const fallbackThinking = pickFallbackThinkingLevel({
+          message: lastAssistant?.errorMessage,
+          attempted: attemptedThinking,
+        });
+        if (fallbackThinking && !aborted) {
+          log.warn(
+            `unsupported thinking level for ${provider}/${modelId}; retrying with ${fallbackThinking}`,
+          );
+          thinkLevel = fallbackThinking;
+          continue;
+        }
+
+        const authFailure = isAuthAssistantError(lastAssistant);
+        const rateLimitFailure = isRateLimitAssistantError(lastAssistant);
+        const billingFailure = isBillingAssistantError(lastAssistant);
+        const failoverFailure = isFailoverAssistantError(lastAssistant);
+        const assistantFailoverReason = classifyFailoverReason(lastAssistant?.errorMessage ?? "");
+        const cloudCodeAssistFormatError = attempt.cloudCodeAssistFormatError;
+        const imageDimensionError = parseImageDimensionError(lastAssistant?.errorMessage ?? "");
+
+        if (imageDimensionError && lastProfileId) {
+          const details = [
+            imageDimensionError.messageIndex !== undefined
+              ? `message=${imageDimensionError.messageIndex}`
+              : null,
+            imageDimensionError.contentIndex !== undefined
+              ? `content=${imageDimensionError.contentIndex}`
+              : null,
+            imageDimensionError.maxDimensionPx !== undefined
+              ? `limit=${imageDimensionError.maxDimensionPx}px`
+              : null,
+          ]
+            .filter(Boolean)
+            .join(" ");
+          log.warn(
+            `Profile ${lastProfileId} rejected image payload${details ? ` (${details})` : ""}.`,
+          );
+        }
+
+        // Treat timeout as potential rate limit (Antigravity hangs on rate limit)
+        const shouldRotate = (!aborted && failoverFailure) || timedOut;
+
+        if (shouldRotate) {
+          if (lastProfileId) {
+            const reason =
+              timedOut || assistantFailoverReason === "timeout"
+                ? "timeout"
+                : (assistantFailoverReason ?? "unknown");
+            await markAuthProfileFailure({
+              store: authStore,
+              profileId: lastProfileId,
+              reason,
+              cfg: params.config,
+              agentDir: params.agentDir,
+            });
+            if (timedOut && !isProbeSession) {
+              log.warn(
+                `Profile ${lastProfileId} timed out (possible rate limit). Trying next account...`,
+              );
+            }
+            if (cloudCodeAssistFormatError) {
+              log.warn(
+                `Profile ${lastProfileId} hit Cloud Code Assist format error. Tool calls will be sanitized on retry.`,
+              );
+            }
+          }
+
+          const rotated = await advanceAuthProfile();
+          if (rotated) {
             continue;
           }
 
-          const authFailure = isAuthAssistantError(lastAssistant);
-          const rateLimitFailure = isRateLimitAssistantError(lastAssistant);
-          const billingFailure = isBillingAssistantError(lastAssistant);
-          const failoverFailure = isFailoverAssistantError(lastAssistant);
-          const assistantFailoverReason = classifyFailoverReason(lastAssistant?.errorMessage ?? "");
-          const cloudCodeAssistFormatError = attempt.cloudCodeAssistFormatError;
-          const imageDimensionError = parseImageDimensionError(lastAssistant?.errorMessage ?? "");
-
-          if (imageDimensionError && lastProfileId) {
-            const details = [
-              imageDimensionError.messageIndex !== undefined
-                ? `message=${imageDimensionError.messageIndex}`
-                : null,
-              imageDimensionError.contentIndex !== undefined
-                ? `content=${imageDimensionError.contentIndex}`
-                : null,
-              imageDimensionError.maxDimensionPx !== undefined
-                ? `limit=${imageDimensionError.maxDimensionPx}px`
-                : null,
-            ]
-              .filter(Boolean)
-              .join(" ");
-            log.warn(
-              `Profile ${lastProfileId} rejected image payload${details ? ` (${details})` : ""}.`,
-            );
+          if (fallbackConfigured) {
+            // Prefer formatted error message (user-friendly) over raw errorMessage
+            const message =
+              (lastAssistant
+                ? formatAssistantErrorText(lastAssistant, {
+                    cfg: params.config,
+                    sessionKey: params.sessionKey ?? params.sessionId,
+                  provider,})
+                : undefined) ||
+              lastAssistant?.errorMessage?.trim() ||
+              (timedOut
+                ? "LLM request timed out."
+                : rateLimitFailure
+                  ? "LLM request rate limited."
+                  : billingFailure
+                    ? formatBillingErrorMessage(provider)
+                    : authFailure
+                      ? "LLM request unauthorized."
+                      : "LLM request failed.");
+            const status =
+              resolveFailoverStatus(assistantFailoverReason ?? "unknown") ??
+              (isTimeoutErrorMessage(message) ? 408 : undefined);
+            throw new FailoverError(message, {
+              reason: assistantFailoverReason ?? "unknown",
+              provider,
+              model: modelId,
+              profileId: lastProfileId,
+              status,
+            });
           }
-
-          // Treat timeout as potential rate limit (Antigravity hangs on rate limit)
-          const shouldRotate = (!aborted && failoverFailure) || timedOut;
-
-          if (shouldRotate) {
-            if (lastProfileId) {
-              const reason =
-                timedOut || assistantFailoverReason === "timeout"
-                  ? "timeout"
-                  : (assistantFailoverReason ?? "unknown");
-              await markAuthProfileFailure({
-                store: authStore,
-                profileId: lastProfileId,
-                reason,
-                cfg: params.config,
-                agentDir: params.agentDir,
-              });
-              if (timedOut && !isProbeSession) {
-                log.warn(
-                  `Profile ${lastProfileId} timed out (possible rate limit). Trying next account...`,
-                );
-              }
-              if (cloudCodeAssistFormatError) {
-                log.warn(
-                  `Profile ${lastProfileId} hit Cloud Code Assist format error. Tool calls will be sanitized on retry.`,
-                );
-              }
-            }
-
-            const rotated = await advanceAuthProfile();
-            if (rotated) {
-              continue;
-            }
-
-            if (fallbackConfigured) {
-              // Prefer formatted error message (user-friendly) over raw errorMessage
-              const message =
-                (lastAssistant
-                  ? formatAssistantErrorText(lastAssistant, {
-                      cfg: params.config,
-                      sessionKey: params.sessionKey ?? params.sessionId,
-                      provider,
-                    })
-                  : undefined) ||
-                lastAssistant?.errorMessage?.trim() ||
-                (timedOut
-                  ? "LLM request timed out."
-                  : rateLimitFailure
-                    ? "LLM request rate limited."
-                    : billingFailure
-                      ? formatBillingErrorMessage(provider)
-                      : authFailure
-                        ? "LLM request unauthorized."
-                        : "LLM request failed.");
-              const status =
-                resolveFailoverStatus(assistantFailoverReason ?? "unknown") ??
-                (isTimeoutErrorMessage(message) ? 408 : undefined);
-              throw new FailoverError(message, {
-                reason: assistantFailoverReason ?? "unknown",
-                provider,
-                model: modelId,
-                profileId: lastProfileId,
-                status,
-              });
-            }
-          }
+        }
 
           const usage = toNormalizedUsage(usageAccumulator);
           // Extract the last individual API call's usage for context-window
@@ -841,63 +845,79 @@ export async function runEmbeddedPiAgent(
             compactionCount: autoCompactionCount > 0 ? autoCompactionCount : undefined,
           };
 
-          const payloads = buildEmbeddedRunPayloads({
-            assistantTexts: attempt.assistantTexts,
-            toolMetas: attempt.toolMetas,
-            lastAssistant: attempt.lastAssistant,
-            lastToolError: attempt.lastToolError,
-            config: params.config,
-            sessionKey: params.sessionKey ?? params.sessionId,
-            provider,
-            verboseLevel: params.verboseLevel,
-            reasoningLevel: params.reasoningLevel,
-            toolResultFormat: resolvedToolResultFormat,
-            inlineToolResultsAllowed: false,
-          });
+        const payloads = buildEmbeddedRunPayloads({
+          assistantTexts: attempt.assistantTexts,
+          toolMetas: attempt.toolMetas,
+          lastAssistant: attempt.lastAssistant,
+          lastToolError: attempt.lastToolError,
+          config: params.config,
+          sessionKey: params.sessionKey ?? params.sessionId,
+          provider,verboseLevel: params.verboseLevel,
+          reasoningLevel: params.reasoningLevel,
+          toolResultFormat: resolvedToolResultFormat,
+          inlineToolResultsAllowed: false,
+        });
 
-          log.debug(
-            `embedded run done: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - started} aborted=${aborted}`,
-          );
-          if (lastProfileId) {
-            await markAuthProfileGood({
-              store: authStore,
-              provider,
-              profileId: lastProfileId,
-              agentDir: params.agentDir,
-            });
-            await markAuthProfileUsed({
-              store: authStore,
-              profileId: lastProfileId,
-              agentDir: params.agentDir,
-            });
-          }
-          return {
-            payloads: payloads.length ? payloads : undefined,
-            meta: {
-              durationMs: Date.now() - started,
-              agentMeta,
-              aborted,
-              systemPromptReport: attempt.systemPromptReport,
-              // Handle client tool calls (OpenResponses hosted tools)
-              stopReason: attempt.clientToolCall ? "tool_calls" : undefined,
-              pendingToolCalls: attempt.clientToolCall
-                ? [
-                    {
-                      id: `call_${Date.now()}`,
-                      name: attempt.clientToolCall.name,
-                      arguments: JSON.stringify(attempt.clientToolCall.params),
-                    },
-                  ]
-                : undefined,
-            },
-            didSendViaMessagingTool: attempt.didSendViaMessagingTool,
-            messagingToolSentTexts: attempt.messagingToolSentTexts,
-            messagingToolSentTargets: attempt.messagingToolSentTargets,
-          };
+        log.debug(
+          `embedded run done: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - started} aborted=${aborted}`,
+        );
+        if (lastProfileId) {
+          await markAuthProfileGood({
+            store: authStore,
+            provider,
+            profileId: lastProfileId,
+            agentDir: params.agentDir,
+          });
+          await markAuthProfileUsed({
+            store: authStore,
+            profileId: lastProfileId,
+            agentDir: params.agentDir,
+          });
         }
-      } finally {
-        process.chdir(prevCwd);
+        return {
+          payloads: payloads.length ? payloads : undefined,
+          meta: {
+            durationMs: Date.now() - started,
+            agentMeta,
+            aborted,
+            systemPromptReport: attempt.systemPromptReport,
+            // Handle client tool calls (OpenResponses hosted tools)
+            stopReason: attempt.clientToolCall ? "tool_calls" : undefined,
+            pendingToolCalls: attempt.clientToolCall
+              ? [
+                  {
+                    id: `call_${Date.now()}`,
+                    name: attempt.clientToolCall.name,
+                    arguments: JSON.stringify(attempt.clientToolCall.params),
+                  },
+                ]
+              : undefined,
+          },
+          didSendViaMessagingTool: attempt.didSendViaMessagingTool,
+          messagingToolSentTexts: attempt.messagingToolSentTexts,
+          messagingToolSentTargets: attempt.messagingToolSentTargets,
+        };
       }
-    }),
-  );
+    } finally {
+      process.chdir(prevCwd);
+    }
+  };
+
+  // Use custom enqueue if provided (for testing/overrides)
+  if (params.enqueue) {
+    return params.enqueue(runTask, { priority });
+  }
+
+  // Use session-based queue for per-session isolation with priority
+  // Sessions don't block each other, but tasks within a session are serialized
+  if (sessionKey && !isProbeSession) {
+    return enqueueSessionTask(runTask, {
+      sessionKey,
+      priority,
+      warnAfterMs: 5000,
+    });
+  }
+
+  // Fallback to global lane for probes or when no session key
+  return enqueueCommandInLane(globalLane, runTask, { priority });
 }

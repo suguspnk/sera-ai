@@ -1,6 +1,7 @@
 import { loadConfig } from "../config/config.js";
 import { callGateway } from "../gateway/call.js";
-import { onAgentEvent } from "../infra/agent-events.js";
+import { onAgentEvent, emitAgentEvent } from "../infra/agent-events.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import { type DeliveryContext, normalizeDeliveryContext } from "../utils/delivery-context.js";
 import { runSubagentAnnounceFlow, type SubagentRunOutcome } from "./subagent-announce.js";
 import {
@@ -8,6 +9,8 @@ import {
   saveSubagentRegistryToDisk,
 } from "./subagent-registry.store.js";
 import { resolveAgentTimeoutMs } from "./timeout.js";
+
+const log = createSubsystemLogger("subagent");
 
 export type SubagentRunRecord = {
   runId: string;
@@ -28,12 +31,15 @@ export type SubagentRunRecord = {
 };
 
 const subagentRuns = new Map<string, SubagentRunRecord>();
-let sweeper: NodeJS.Timeout | null = null;
+let sweepTimer: NodeJS.Timeout | null = null;
 let listenerStarted = false;
 let listenerStop: (() => void) | null = null;
 // Use var to avoid TDZ when init runs across circular imports during bootstrap.
 var restoreAttempted = false;
 const SUBAGENT_ANNOUNCE_TIMEOUT_MS = 120_000;
+
+// Track pending completion waiters for immediate notification
+const completionWaiters = new Map<string, Set<(record: SubagentRunRecord) => void>>();
 
 function persistSubagentRuns() {
   try {
@@ -83,10 +89,9 @@ function resumeSubagentRun(runId: string) {
     return;
   }
 
-  // Wait for completion again after restart.
-  const cfg = loadConfig();
-  const waitTimeoutMs = resolveSubagentWaitTimeoutMs(cfg, undefined);
-  void waitForSubagentCompletion(runId, waitTimeoutMs);
+  // For runs that haven't completed, just ensure the listener is active.
+  // The event-driven listener will handle completion.
+  ensureListener();
   resumedRuns.add(runId);
 }
 
@@ -112,9 +117,7 @@ function restoreSubagentRunsOnce() {
 
     // Resume pending work.
     ensureListener();
-    if ([...subagentRuns.values()].some((entry) => entry.archiveAtMs)) {
-      startSweeper();
-    }
+    scheduleSweepIfNeeded();
     for (const runId of subagentRuns.keys()) {
       resumeSubagentRun(runId);
     }
@@ -139,49 +142,127 @@ function resolveSubagentWaitTimeoutMs(
   return resolveAgentTimeoutMs({ cfg, overrideSeconds: runTimeoutSeconds });
 }
 
-function startSweeper() {
-  if (sweeper) {
-    return;
+/**
+ * Schedule a sweep at the earliest archive time.
+ * This replaces the fixed 60-second interval with precise scheduling.
+ */
+function scheduleSweepIfNeeded() {
+  // Cancel any existing timer
+  if (sweepTimer) {
+    clearTimeout(sweepTimer);
+    sweepTimer = null;
   }
-  sweeper = setInterval(() => {
+
+  // Find the earliest archive time
+  let earliestArchiveAt: number | undefined;
+  for (const entry of subagentRuns.values()) {
+    if (entry.archiveAtMs && (!earliestArchiveAt || entry.archiveAtMs < earliestArchiveAt)) {
+      earliestArchiveAt = entry.archiveAtMs;
+    }
+  }
+
+  if (!earliestArchiveAt) {
+    return; // No items to archive
+  }
+
+  const now = Date.now();
+  const delayMs = Math.max(1000, earliestArchiveAt - now); // At least 1 second
+
+  log.debug(`scheduling sweep in ${Math.round(delayMs / 1000)}s for ${subagentRuns.size} runs`);
+
+  sweepTimer = setTimeout(() => {
+    sweepTimer = null;
     void sweepSubagentRuns();
-  }, 60_000);
-  sweeper.unref?.();
+  }, delayMs);
+  sweepTimer.unref?.();
 }
 
 function stopSweeper() {
-  if (!sweeper) {
-    return;
+  if (sweepTimer) {
+    clearTimeout(sweepTimer);
+    sweepTimer = null;
   }
-  clearInterval(sweeper);
-  sweeper = null;
 }
 
 async function sweepSubagentRuns() {
   const now = Date.now();
   let mutated = false;
+  const toDelete: string[] = [];
+
   for (const [runId, entry] of subagentRuns.entries()) {
     if (!entry.archiveAtMs || entry.archiveAtMs > now) {
       continue;
     }
+    toDelete.push(runId);
+  }
+
+  for (const runId of toDelete) {
+    const entry = subagentRuns.get(runId);
     subagentRuns.delete(runId);
     mutated = true;
-    try {
-      await callGateway({
-        method: "sessions.delete",
-        params: { key: entry.childSessionKey, deleteTranscript: true },
-        timeoutMs: 10_000,
-      });
-    } catch {
-      // ignore
+
+    if (entry) {
+      log.debug(`archived subagent run: ${runId} session=${entry.childSessionKey}`);
+      try {
+        await callGateway({
+          method: "sessions.delete",
+          params: { key: entry.childSessionKey, deleteTranscript: true },
+          timeoutMs: 10_000,
+        });
+      } catch {
+        // ignore
+      }
     }
   }
+
   if (mutated) {
     persistSubagentRuns();
   }
-  if (subagentRuns.size === 0) {
-    stopSweeper();
+
+  // Schedule next sweep if there are more items
+  scheduleSweepIfNeeded();
+}
+
+/**
+ * Notify completion waiters immediately when a subagent completes.
+ */
+function notifyCompletionWaiters(runId: string, record: SubagentRunRecord) {
+  const waiters = completionWaiters.get(runId);
+  if (!waiters || waiters.size === 0) {
+    return;
   }
+
+  for (const waiter of waiters) {
+    try {
+      waiter(record);
+    } catch {
+      // ignore callback errors
+    }
+  }
+
+  completionWaiters.delete(runId);
+}
+
+/**
+ * Emit a subagent completion event to the parent session.
+ * This allows the parent to react immediately without polling.
+ */
+function emitSubagentCompletionEvent(record: SubagentRunRecord) {
+  emitAgentEvent({
+    runId: record.runId,
+    stream: "lifecycle",
+    sessionKey: record.requesterSessionKey,
+    data: {
+      phase: "subagent_complete",
+      childSessionKey: record.childSessionKey,
+      childRunId: record.runId,
+      outcome: record.outcome,
+      startedAt: record.startedAt,
+      endedAt: record.endedAt,
+      task: record.task,
+      label: record.label,
+    },
+  });
 }
 
 function ensureListener() {
@@ -204,11 +285,13 @@ function ensureListener() {
         entry.startedAt = startedAt;
         persistSubagentRuns();
       }
+      log.debug(`subagent started: ${evt.runId} session=${entry.childSessionKey}`);
       return;
     }
     if (phase !== "end" && phase !== "error") {
       return;
     }
+
     const endedAt = typeof evt.data?.endedAt === "number" ? evt.data.endedAt : Date.now();
     entry.endedAt = endedAt;
     if (phase === "error") {
@@ -220,6 +303,14 @@ function ensureListener() {
       entry.outcome = { status: "ok" };
     }
     persistSubagentRuns();
+
+    log.debug(`subagent completed: ${evt.runId} status=${entry.outcome?.status} duration=${endedAt - (entry.startedAt ?? entry.createdAt)}ms`);
+
+    // Notify completion waiters immediately
+    notifyCompletionWaiters(evt.runId, entry);
+
+    // Emit event to parent session for immediate reaction
+    emitSubagentCompletionEvent(entry);
 
     if (!beginSubagentCleanup(evt.runId)) {
       return;
@@ -296,8 +387,8 @@ export function registerSubagentRun(params: {
   const cfg = loadConfig();
   const archiveAfterMs = resolveArchiveAfterMs(cfg);
   const archiveAtMs = archiveAfterMs ? now + archiveAfterMs : undefined;
-  const waitTimeoutMs = resolveSubagentWaitTimeoutMs(cfg, params.runTimeoutSeconds);
   const requesterOrigin = normalizeDeliveryContext(params.requesterOrigin);
+
   subagentRuns.set(params.runId, {
     runId: params.runId,
     childSessionKey: params.childSessionKey,
@@ -312,92 +403,100 @@ export function registerSubagentRun(params: {
     archiveAtMs,
     cleanupHandled: false,
   });
+
   ensureListener();
   persistSubagentRuns();
+
   if (archiveAfterMs) {
-    startSweeper();
+    scheduleSweepIfNeeded();
   }
-  // Wait for subagent completion via gateway RPC (cross-process).
-  // The in-process lifecycle listener is a fallback for embedded runs.
-  void waitForSubagentCompletion(params.runId, waitTimeoutMs);
+
+  log.debug(`subagent registered: ${params.runId} child=${params.childSessionKey} parent=${params.requesterSessionKey}`);
 }
 
-async function waitForSubagentCompletion(runId: string, waitTimeoutMs: number) {
-  try {
-    const timeoutMs = Math.max(1, Math.floor(waitTimeoutMs));
-    const wait = await callGateway<{
-      status?: string;
-      startedAt?: number;
-      endedAt?: number;
-      error?: string;
-    }>({
-      method: "agent.wait",
-      params: {
-        runId,
-        timeoutMs,
-      },
-      timeoutMs: timeoutMs + 10_000,
-    });
-    if (wait?.status !== "ok" && wait?.status !== "error" && wait?.status !== "timeout") {
-      return;
-    }
-    const entry = subagentRuns.get(runId);
-    if (!entry) {
-      return;
-    }
-    let mutated = false;
-    if (typeof wait.startedAt === "number") {
-      entry.startedAt = wait.startedAt;
-      mutated = true;
-    }
-    if (typeof wait.endedAt === "number") {
-      entry.endedAt = wait.endedAt;
-      mutated = true;
-    }
-    if (!entry.endedAt) {
-      entry.endedAt = Date.now();
-      mutated = true;
-    }
-    const waitError = typeof wait.error === "string" ? wait.error : undefined;
-    entry.outcome =
-      wait.status === "error"
-        ? { status: "error", error: waitError }
-        : wait.status === "timeout"
-          ? { status: "timeout" }
-          : { status: "ok" };
-    mutated = true;
-    if (mutated) {
-      persistSubagentRuns();
-    }
-    if (!beginSubagentCleanup(runId)) {
-      return;
-    }
-    const requesterOrigin = normalizeDeliveryContext(entry.requesterOrigin);
-    void runSubagentAnnounceFlow({
-      childSessionKey: entry.childSessionKey,
-      childRunId: entry.runId,
-      requesterSessionKey: entry.requesterSessionKey,
-      requesterOrigin,
-      requesterDisplayKey: entry.requesterDisplayKey,
-      task: entry.task,
-      timeoutMs: SUBAGENT_ANNOUNCE_TIMEOUT_MS,
-      cleanup: entry.cleanup,
-      waitForCompletion: false,
-      startedAt: entry.startedAt,
-      endedAt: entry.endedAt,
-      label: entry.label,
-      outcome: entry.outcome,
-    }).then((didAnnounce) => {
-      finalizeSubagentCleanup(runId, entry.cleanup, didAnnounce);
-    });
-  } catch {
-    // ignore
+/**
+ * Wait for a subagent to complete.
+ * Uses event-driven notification for immediate response.
+ *
+ * @returns The completed record, or null if timeout
+ */
+export function waitForSubagentRun(
+  runId: string,
+  timeoutMs: number,
+): Promise<SubagentRunRecord | null> {
+  const entry = subagentRuns.get(runId);
+
+  // Already completed
+  if (entry?.endedAt) {
+    return Promise.resolve(entry);
   }
+
+  // Not found
+  if (!entry) {
+    return Promise.resolve(null);
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const finish = (record: SubagentRunRecord | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+
+      // Remove from waiters
+      const waiters = completionWaiters.get(runId);
+      if (waiters) {
+        waiters.delete(callback);
+        if (waiters.size === 0) {
+          completionWaiters.delete(runId);
+        }
+      }
+
+      resolve(record);
+    };
+
+    const callback = (record: SubagentRunRecord) => {
+      finish(record);
+    };
+
+    // Register waiter
+    let waiters = completionWaiters.get(runId);
+    if (!waiters) {
+      waiters = new Set();
+      completionWaiters.set(runId, waiters);
+    }
+    waiters.add(callback);
+
+    // Timeout
+    const timer = setTimeout(() => finish(null), Math.max(1, timeoutMs));
+  });
+}
+
+/**
+ * Get all active (non-completed) subagent runs for a requester.
+ */
+export function getActiveSubagentRuns(requesterSessionKey: string): SubagentRunRecord[] {
+  const key = requesterSessionKey.trim();
+  if (!key) {
+    return [];
+  }
+  return [...subagentRuns.values()].filter(
+    (entry) => entry.requesterSessionKey === key && !entry.endedAt
+  );
+}
+
+/**
+ * Get a subagent run by ID.
+ */
+export function getSubagentRun(runId: string): SubagentRunRecord | undefined {
+  return subagentRuns.get(runId);
 }
 
 export function resetSubagentRegistryForTests() {
   subagentRuns.clear();
   resumedRuns.clear();
+  completionWaiters.clear();
   stopSweeper();
   restoreAttempted = false;
   if (listenerStop) {

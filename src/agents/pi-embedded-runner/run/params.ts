@@ -3,6 +3,7 @@ import type { ReasoningLevel, ThinkLevel, VerboseLevel } from "../../../auto-rep
 import type { AgentStreamParams } from "../../../commands/agent/types.js";
 import type { OpenClawConfig } from "../../../config/config.js";
 import type { enqueueCommand } from "../../../process/command-queue.js";
+import type { TaskPriority } from "../../../process/lanes.js";
 import type { InputProvenance } from "../../../sessions/input-provenance.js";
 import type { ExecElevatedDefaults, ExecToolDefaults } from "../../bash-tools.js";
 import type { BlockReplyChunking, ToolResultFormat } from "../../pi-embedded-subscribe.js";
@@ -99,6 +100,18 @@ export type RunEmbeddedPiAgentParams = {
   onAgentEvent?: (evt: { stream: string; data: Record<string, unknown> }) => void;
   lane?: string;
   enqueue?: typeof enqueueCommand;
+  /** Task priority for queue scheduling (Urgent > Normal > Background) */
+  priority?: TaskPriority;
+  /** Hint: this is a direct mention of the bot */
+  isMention?: boolean;
+  /** Hint: this is a reply to the bot */
+  isReply?: boolean;
+  /** Hint: this run is triggered by heartbeat */
+  isHeartbeat?: boolean;
+  /** Hint: this run is triggered by cron */
+  isCron?: boolean;
+  /** Hint: this is a subagent run */
+  isSubagent?: boolean;
   extraSystemPrompt?: string;
   inputProvenance?: InputProvenance;
   streamParams?: AgentStreamParams;
