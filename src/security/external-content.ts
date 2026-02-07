@@ -8,9 +8,22 @@
  * system prompts or treated as trusted instructions.
  */
 
+import {
+  scanContentSync,
+  removeInvisibleChars,
+  type ContentSource as PromptGuardSource,
+  type ScanResult,
+  type ThreatLevel,
+} from "./prompt-guard.js";
+
+// Re-export for convenience
+export { scanContent, scanContentSync, guardContent, formatScanSummary } from "./prompt-guard.js";
+export type { ScanResult, ThreatLevel, GuardedContent } from "./prompt-guard.js";
+
 /**
  * Patterns that may indicate prompt injection attempts.
  * These are logged for monitoring but content is still processed (wrapped safely).
+ * @deprecated Use scanContentSync from prompt-guard.ts for comprehensive detection
  */
 const SUSPICIOUS_PATTERNS = [
   /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?)/i,
@@ -29,6 +42,7 @@ const SUSPICIOUS_PATTERNS = [
 
 /**
  * Check if content contains suspicious patterns that may indicate injection.
+ * @deprecated Use scanContentSync from prompt-guard.ts for comprehensive detection
  */
 export function detectSuspiciousPatterns(content: string): string[] {
   const matches: string[] = [];
@@ -38,6 +52,22 @@ export function detectSuspiciousPatterns(content: string): string[] {
     }
   }
   return matches;
+}
+
+/**
+ * Map external content source to prompt guard source type.
+ */
+function toPromptGuardSource(source: ExternalContentSource): PromptGuardSource {
+  switch (source) {
+    case "email":
+      return "email_body";
+    case "web_fetch":
+      return "web_fetch";
+    case "web_search":
+      return "web_fetch";
+    default:
+      return "unknown";
+  }
 }
 
 /**
@@ -181,7 +211,15 @@ export type WrapExternalContentOptions = {
 export function wrapExternalContent(content: string, options: WrapExternalContentOptions): string {
   const { source, sender, subject, includeWarning = true } = options;
 
-  const sanitized = replaceMarkers(content);
+  // Scan content for injection attempts and invisible characters
+  const scanResult = scanContentSync(content, toPromptGuardSource(source));
+
+  // Remove invisible characters if detected
+  let sanitized = replaceMarkers(content);
+  if (scanResult.invisibleChars.length > 0) {
+    sanitized = removeInvisibleChars(sanitized);
+  }
+
   const sourceLabel = EXTERNAL_SOURCE_LABELS[source] ?? "External";
   const metadataLines: string[] = [`Source: ${sourceLabel}`];
 
@@ -190,6 +228,26 @@ export function wrapExternalContent(content: string, options: WrapExternalConten
   }
   if (subject) {
     metadataLines.push(`Subject: ${subject}`);
+  }
+
+  // Add security annotations from scan
+  metadataLines.push(`Trust Score: ${(scanResult.trustScore * 100).toFixed(0)}%`);
+
+  if (scanResult.threatLevel !== "SAFE") {
+    metadataLines.push(`⚠️ Threat Level: ${scanResult.threatLevel}`);
+  }
+
+  if (scanResult.invisibleChars.length > 0) {
+    const dangerous = scanResult.invisibleChars.filter((ic) => ic.isDangerous).length;
+    if (dangerous > 0) {
+      metadataLines.push(`🚨 ${dangerous} dangerous invisible characters removed`);
+    } else {
+      metadataLines.push(`📝 ${scanResult.invisibleChars.length} invisible characters removed`);
+    }
+  }
+
+  if (scanResult.detections.length > 0) {
+    metadataLines.push(`🛡️ ${scanResult.detections.length} injection patterns detected`);
   }
 
   const metadata = metadataLines.join("\n");
@@ -203,6 +261,19 @@ export function wrapExternalContent(content: string, options: WrapExternalConten
     sanitized,
     EXTERNAL_CONTENT_END,
   ].join("\n");
+}
+
+/**
+ * Enhanced content wrapping with full scan result.
+ * Returns both wrapped content and scan details for logging/analysis.
+ */
+export function wrapExternalContentWithScan(
+  content: string,
+  options: WrapExternalContentOptions,
+): { wrapped: string; scanResult: ScanResult } {
+  const scanResult = scanContentSync(content, toPromptGuardSource(options.source));
+  const wrapped = wrapExternalContent(content, options);
+  return { wrapped, scanResult };
 }
 
 /**
