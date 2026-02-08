@@ -42,6 +42,7 @@ import { scheduleGatewayUpdateCheck } from "../infra/update-startup.js";
 import { startDiagnosticHeartbeat, stopDiagnosticHeartbeat } from "../logging/diagnostic.js";
 import { createSubsystemLogger, runtimeForLogger } from "../logging/subsystem.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
+import { startVoiceGateway } from "../voice/voice-gateway.js";
 import { runOnboardingWizard } from "../wizard/onboarding.js";
 import { startGatewayConfigReloader } from "./config-reload.js";
 import { ExecApprovalManager } from "./exec-approval-manager.js";
@@ -538,6 +539,10 @@ export async function startGatewayServer(
     isNixMode,
   });
   scheduleGatewayUpdateCheck({ cfg: cfgAtStart, log, isNixMode });
+
+  // Start voice streaming gateway (separate WebSocket path: /voice/stream)
+  startVoiceGateway(httpServer);
+
   const tailscaleCleanup = await startGatewayTailscaleExposure({
     tailscaleMode,
     resetOnExit: tailscaleConfig.resetOnExit,
