@@ -9,9 +9,9 @@ import {
 } from "../../utils/message-channel.js";
 import { resolveChunkMode, resolveTextChunkLimit, type TextChunkProvider } from "../chunk.js";
 
-const DEFAULT_BLOCK_STREAM_MIN = 800;
+const DEFAULT_BLOCK_STREAM_MIN = 150;
 const DEFAULT_BLOCK_STREAM_MAX = 1200;
-const DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS = 1000;
+const DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS = 400;
 const getBlockChunkProviders = () =>
   new Set<TextChunkProvider>([...listDeliverableMessageChannels(), INTERNAL_MESSAGE_CHANNEL]);
 
