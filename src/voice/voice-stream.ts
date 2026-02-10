@@ -47,6 +47,7 @@ type VoiceClientMessage =
 type VoiceServerMessage =
   | { type: "audio_start"; voice: string }
   | { type: "audio_end"; duration: number }
+  | { type: "response_text"; text: string }
   | { type: "error"; message: string }
   | { type: "pong" };
 
@@ -275,6 +276,8 @@ async function handleClientMessage(
           const llmResponse = await onTextMessage(message.text, session);
           if (llmResponse) {
             responseText = llmResponse;
+            // Send response text to client for transcript
+            sendToClient(session, { type: "response_text", text: responseText });
           }
         }
 
@@ -327,6 +330,7 @@ export function attachVoiceStreamHandler(
 ): WebSocketServer {
   const config = getVoiceConfig(cfg);
 
+  // Simple setup - dedicated server, no conflicts
   const wss = new WebSocketServer({
     server,
     path: "/voice/stream",

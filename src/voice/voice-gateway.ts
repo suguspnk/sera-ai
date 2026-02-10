@@ -2,16 +2,105 @@
  * Voice gateway integration - connects voice streaming to the main gateway.
  *
  * This file provides the integration point between the voice streaming module
- * and the OpenClaw gateway. It handles the LLM processing for voice messages.
+ * and the OpenClaw gateway. It handles the LLM processing for voice messages
+ * using the gateway's OpenAI-compatible HTTP endpoint.
+ *
+ * Runs on a SEPARATE port (default 18790) to avoid WebSocket upgrade conflicts.
  */
 
-import type { Server as HttpServer } from "node:http";
+import { createServer, type Server as HttpServer } from "node:http";
 import type { OpenClawConfig } from "../config/config.js";
-import { loadConfig } from "../config/config.js";
+import { loadConfig, resolveGatewayPort } from "../config/config.js";
 import { logVerbose } from "../globals.js";
 
+const VOICE_PORT = parseInt(process.env.VOICE_PORT || "18790", 10);
+
 const logWarn = (msg: string) => console.warn(`[voice] ${msg}`);
+const logError = (msg: string) => console.error(`[voice] ${msg}`);
 import { attachVoiceStreamHandler, type VoiceSession } from "./voice-stream.js";
+
+// Conversation history per voice session
+const conversationHistory = new Map<
+  string,
+  Array<{ role: "system" | "user" | "assistant"; content: string }>
+>();
+
+/**
+ * Call the gateway's OpenAI-compatible endpoint for chat completion.
+ */
+async function callGatewayLLM(
+  text: string,
+  voiceSessionId: string,
+  cfg: OpenClawConfig,
+): Promise<string | null> {
+  try {
+    // Get or create conversation history
+    let history = conversationHistory.get(voiceSessionId);
+    if (!history) {
+      history = [
+        {
+          role: "system" as const,
+          content:
+            "You are a helpful voice assistant. Keep responses concise and conversational, suitable for spoken delivery. Aim for 1-3 sentences unless more detail is explicitly requested.",
+        },
+      ];
+      conversationHistory.set(voiceSessionId, history);
+    }
+
+    // Add user message
+    history.push({ role: "user" as const, content: text });
+
+    // Keep history manageable (last 20 messages + system)
+    if (history.length > 21) {
+      history = [history[0], ...history.slice(-20)];
+      conversationHistory.set(voiceSessionId, history);
+    }
+
+    // Get gateway port
+    const port = resolveGatewayPort(cfg);
+    const url = `http://127.0.0.1:${port}/v1/chat/completions`;
+
+    // Get auth token from config
+    const token = cfg.gateway?.auth?.token || cfg.gateway?.auth?.password || "";
+
+    logVerbose(`Voice calling gateway LLM at ${url}`);
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({
+        model: cfg.agent?.model || "default",
+        messages: history,
+        max_tokens: 1024,
+        stream: false,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      logError(`Gateway LLM error: ${response.status} - ${error}`);
+      return "I'm having trouble connecting right now. Please try again.";
+    }
+
+    const data = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const assistantMessage =
+      data.choices?.[0]?.message?.content?.trim() || "I'm not sure how to respond to that.";
+
+    // Add to history
+    history.push({ role: "assistant" as const, content: assistantMessage });
+
+    return assistantMessage;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : "Unknown error";
+    logError(`Voice LLM call failed: ${msg}`);
+    return "I encountered an error processing your request. Please try again.";
+  }
+}
 
 export interface VoiceGatewayOptions {
   /** Callback to process user text and get LLM response */
@@ -37,7 +126,7 @@ export interface VoiceGatewayOptions {
  * });
  * ```
  */
-export function startVoiceGateway(httpServer: HttpServer, options?: VoiceGatewayOptions): void {
+export function startVoiceGateway(_httpServer: HttpServer, options?: VoiceGatewayOptions): void {
   const cfg = loadConfig();
 
   // Check if voice is enabled (TTS must be configured)
@@ -48,17 +137,38 @@ export function startVoiceGateway(httpServer: HttpServer, options?: VoiceGateway
   }
 
   try {
-    const wss = attachVoiceStreamHandler(
-      httpServer,
-      cfg,
-      options?.onUserMessage
-        ? async (text: string, session: VoiceSession) => {
-            return options.onUserMessage!(text, session.id);
-          }
-        : undefined,
-    );
+    // Create a SEPARATE HTTP server for voice to avoid upgrade conflicts
+    const voiceServer = createServer((req, res) => {
+      // Simple health check
+      if (req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok", service: "voice" }));
+        return;
+      }
+      res.writeHead(404);
+      res.end("Voice WebSocket server - connect via ws://");
+    });
 
-    logVerbose(`Voice gateway started at /voice/stream`);
+    // Use provided handler or default to gateway's OpenAI-compatible endpoint
+    const messageHandler = options?.onUserMessage
+      ? async (text: string, session: VoiceSession) => {
+          return options.onUserMessage!(text, session.id);
+        }
+      : async (text: string, session: VoiceSession) => {
+          logVerbose(`Voice message from ${session.id}: ${text}`);
+          return callGatewayLLM(text, session.id, cfg);
+        };
+
+    const wss = attachVoiceStreamHandler(voiceServer, cfg, messageHandler);
+
+    voiceServer.listen(VOICE_PORT, "0.0.0.0", () => {
+      logVerbose(`Voice gateway started on port ${VOICE_PORT} (separate server)`);
+      console.log(`[voice] Voice WebSocket available at ws://localhost:${VOICE_PORT}/voice/stream`);
+    });
+
+    voiceServer.on("error", (err) => {
+      logError(`Voice server error: ${err.message}`);
+    });
   } catch (error) {
     const msg = error instanceof Error ? error.message : "Unknown error";
     logWarn(`Failed to start voice gateway: ${msg}`);
