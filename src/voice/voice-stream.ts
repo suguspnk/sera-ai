@@ -139,7 +139,9 @@ async function streamTTSToClient(
       }
 
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        break;
+      }
 
       // Send audio chunk as binary
       if (session.clientWs.readyState === WebSocket.OPEN) {
@@ -277,7 +279,9 @@ async function handleClientMessage(
         break;
 
       case "text":
-        if (!message.text?.trim()) break;
+        if (!message.text?.trim()) {
+          break;
+        }
 
         // If callback provided, get LLM response first
         let responseText = message.text;
@@ -296,7 +300,8 @@ async function handleClientMessage(
         }
 
         // Stream TTS
-        await streamTTSViaWebSocket(session, responseText, config);
+        // HTTP streaming avoids WS-to-WS binary corruption
+        await streamTTSToClient(session, responseText, config);
         break;
 
       case "interrupt":
