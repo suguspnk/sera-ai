@@ -296,8 +296,7 @@ async function handleClientMessage(
         }
 
         // Stream TTS
-        // Use HTTP streaming - WebSocket forwarding corrupts binary data
-        await streamTTSToClient(session, responseText, config);
+        await streamTTSViaWebSocket(session, responseText, config);
         break;
 
       case "interrupt":
