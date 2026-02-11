@@ -143,8 +143,17 @@ async function streamTTSToClient(
 
       // Send audio chunk as binary
       if (session.clientWs.readyState === WebSocket.OPEN) {
-        session.clientWs.send(value);
-        totalBytes += value.length;
+        // Convert Uint8Array to Buffer and log first samples
+        const buf = Buffer.from(value);
+        if (totalBytes === 0 && buf.length >= 20) {
+          const samples = [];
+          for (let i = 0; i < 20; i += 2) {
+            samples.push(buf.readInt16LE(i));
+          }
+          logVerbose(`First chunk ${buf.length} bytes, first 10 samples: [${samples.join(", ")}]`);
+        }
+        session.clientWs.send(buf);
+        totalBytes += buf.length;
       }
     }
 
@@ -287,7 +296,8 @@ async function handleClientMessage(
         }
 
         // Stream TTS
-        await streamTTSViaWebSocket(session, responseText, config);
+        // Use HTTP streaming - WebSocket forwarding corrupts binary data
+        await streamTTSToClient(session, responseText, config);
         break;
 
       case "interrupt":
@@ -331,9 +341,11 @@ export function attachVoiceStreamHandler(
   const config = getVoiceConfig(cfg);
 
   // Simple setup - dedicated server, no conflicts
+  // Disable perMessageDeflate to prevent binary audio corruption
   const wss = new WebSocketServer({
     server,
     path: "/voice/stream",
+    perMessageDeflate: false,
   });
 
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
