@@ -9,11 +9,17 @@
  */
 
 import { createServer, type Server as HttpServer } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import { readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { OpenClawConfig } from "../config/config.js";
 import { loadConfig, resolveGatewayPort } from "../config/config.js";
 import { logVerbose } from "../globals.js";
 
 const VOICE_PORT = parseInt(process.env.VOICE_PORT || "18790", 10);
+const VOICE_SSL_CERT = process.env.VOICE_SSL_CERT || join(homedir(), ".openclaw/certs/lima-openclaw.tailcc9ed4.ts.net.crt");
+const VOICE_SSL_KEY = process.env.VOICE_SSL_KEY || join(homedir(), ".openclaw/certs/lima-openclaw.tailcc9ed4.ts.net.key");
 
 const logWarn = (msg: string) => console.warn(`[voice] ${msg}`);
 const logError = (msg: string) => console.error(`[voice] ${msg}`);
@@ -137,17 +143,34 @@ export function startVoiceGateway(_httpServer: HttpServer, options?: VoiceGatewa
   }
 
   try {
-    // Create a SEPARATE HTTP server for voice to avoid upgrade conflicts
-    const voiceServer = createServer((req, res) => {
+    // Check if SSL certs are available for secure voice connections
+    const useSSL = existsSync(VOICE_SSL_CERT) && existsSync(VOICE_SSL_KEY);
+    
+    const requestHandler = (req: any, res: any) => {
       // Simple health check
       if (req.url === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok", service: "voice" }));
+        res.end(JSON.stringify({ status: "ok", service: "voice", ssl: useSSL }));
         return;
       }
       res.writeHead(404);
-      res.end("Voice WebSocket server - connect via ws://");
-    });
+      res.end(`Voice WebSocket server - connect via ${useSSL ? "wss" : "ws"}://`);
+    };
+
+    // Create HTTPS server if certs available, otherwise HTTP
+    const voiceServer = useSSL
+      ? createHttpsServer(
+          {
+            cert: readFileSync(VOICE_SSL_CERT),
+            key: readFileSync(VOICE_SSL_KEY),
+          },
+          requestHandler,
+        )
+      : createServer(requestHandler);
+
+    if (useSSL) {
+      logVerbose(`Voice server using SSL with cert: ${VOICE_SSL_CERT}`);
+    }
 
     // Use provided handler or default to gateway's OpenAI-compatible endpoint
     const messageHandler = options?.onUserMessage
@@ -162,8 +185,9 @@ export function startVoiceGateway(_httpServer: HttpServer, options?: VoiceGatewa
     const wss = attachVoiceStreamHandler(voiceServer, cfg, messageHandler);
 
     voiceServer.listen(VOICE_PORT, "0.0.0.0", () => {
-      logVerbose(`Voice gateway started on port ${VOICE_PORT} (separate server)`);
-      console.log(`[voice] Voice WebSocket available at ws://localhost:${VOICE_PORT}/voice/stream`);
+      const protocol = useSSL ? "wss" : "ws";
+      logVerbose(`Voice gateway started on port ${VOICE_PORT} (${useSSL ? "HTTPS/WSS" : "HTTP/WS"})`);
+      console.log(`[voice] Voice WebSocket available at ${protocol}://localhost:${VOICE_PORT}/voice/stream`);
     });
 
     voiceServer.on("error", (err) => {
