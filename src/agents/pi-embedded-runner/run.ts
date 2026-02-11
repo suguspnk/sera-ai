@@ -183,7 +183,7 @@ export async function runEmbeddedPiAgent(
 
   // Use session-based queue if we have a session key (per-session isolation)
   // Otherwise fall back to global lane (backward compatibility)
-  const runTask = async () => {
+  const runTask = async (): Promise<EmbeddedPiRunResult> => {
     const started = Date.now();
     const workspaceResolution = resolveRunWorkspaceDir({
       workspaceDir: params.workspaceDir,
@@ -605,7 +605,7 @@ export async function runEmbeddedPiAgent(
                 );
               }
             }
-            const kind = isCompactionFailure ? "compaction_failure" : "context_overflow";
+            const kind: "context_overflow" | "compaction_failure" = isCompactionFailure ? "compaction_failure" : "context_overflow";
             return {
               payloads: [
                 {
