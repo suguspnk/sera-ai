@@ -162,14 +162,6 @@ async function streamTTSToClient(
 
       // Send audio chunk as binary
       if (session.clientWs.readyState === WebSocket.OPEN && chunk.length > 0) {
-        // Log ALL chunks for debugging the zero-byte issue
-        const rawBytes = Array.from(chunk.slice(0, Math.min(20, chunk.length)));
-        const isAllZeros = rawBytes.every((b) => b === 0);
-        console.log(
-          `[voice] Sending chunk #${Math.floor(totalBytes / 65536) + 1}: ${chunk.length} bytes, ` +
-            `allZeros=${isAllZeros}, first 20: [${rawBytes.join(", ")}]`,
-        );
-        // Explicitly send as binary frame
         session.clientWs.send(chunk, { binary: true });
         totalBytes += chunk.length;
       }
