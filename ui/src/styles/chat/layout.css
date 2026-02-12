@@ -259,6 +259,38 @@
   justify-content: flex-end;
 }
 
+/* Message audio (TTS voice messages) */
+.chat-message-audio {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.chat-audio-player {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chat-audio-player audio {
+  max-width: 100%;
+  min-width: 250px;
+  height: 40px;
+  border-radius: 8px;
+}
+
+.chat-audio-label {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  opacity: 0.7;
+}
+
+/* User audio aligns right */
+.chat-group.user .chat-message-audio {
+  align-items: flex-end;
+}
+
 /* Compose input row - horizontal layout */
 .chat-compose__row {
   display: flex;

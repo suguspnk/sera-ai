@@ -17,6 +17,40 @@ type ImageBlock = {
   alt?: string;
 };
 
+type AudioBlock = {
+  url: string;
+  label?: string;
+};
+
+const MEDIA_PATH_REGEX = /MEDIA:([^\s]+)/g;
+
+function filePathToMediaUrl(filePath: string): string {
+  // Base64url encode the path
+  const encoded = btoa(filePath)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  return `/media/${encoded}`;
+}
+
+function extractAudioFromText(text: string): { audio: AudioBlock[]; cleanedText: string } {
+  const audio: AudioBlock[] = [];
+  const cleanedText = text.replace(MEDIA_PATH_REGEX, (match, filePath) => {
+    // Check if it's an audio file
+    const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
+    const audioExts = ["mp3", "opus", "ogg", "wav", "webm", "m4a", "aac", "flac"];
+    if (audioExts.includes(ext)) {
+      audio.push({
+        url: filePathToMediaUrl(filePath),
+        label: "Voice message",
+      });
+      return ""; // Remove from text
+    }
+    return match; // Keep non-audio MEDIA: paths as-is
+  });
+  return { audio, cleanedText: cleanedText.trim() };
+}
+
 function extractImages(message: unknown): ImageBlock[] {
   const m = message as Record<string, unknown>;
   const content = m.content;
@@ -215,6 +249,27 @@ function renderMessageImages(images: ImageBlock[]) {
   `;
 }
 
+function renderMessageAudio(audioBlocks: AudioBlock[]) {
+  if (audioBlocks.length === 0) {
+    return nothing;
+  }
+
+  return html`
+    <div class="chat-message-audio">
+      ${audioBlocks.map(
+        (audio) => html`
+          <div class="chat-audio-player">
+            <audio controls preload="metadata" src=${audio.url}>
+              Your browser does not support the audio element.
+            </audio>
+            ${audio.label ? html`<span class="chat-audio-label">${audio.label}</span>` : nothing}
+          </div>
+        `,
+      )}
+    </div>
+  `;
+}
+
 function renderGroupedMessage(
   message: unknown,
   opts: { isStreaming: boolean; showReasoning: boolean },
@@ -237,7 +292,14 @@ function renderGroupedMessage(
   const extractedText = extractTextCached(message);
   const extractedThinking =
     opts.showReasoning && role === "assistant" ? extractThinkingCached(message) : null;
-  const markdownBase = extractedText?.trim() ? extractedText : null;
+  
+  // Extract audio from MEDIA: paths in text
+  const { audio: audioBlocks, cleanedText } = extractedText 
+    ? extractAudioFromText(extractedText)
+    : { audio: [], cleanedText: "" };
+  const hasAudio = audioBlocks.length > 0;
+  
+  const markdownBase = cleanedText?.trim() ? cleanedText : null;
   const reasoningMarkdown = extractedThinking ? formatReasoningMarkdown(extractedThinking) : null;
   const markdown = markdownBase;
   const canCopyMarkdown = role === "assistant" && Boolean(markdown?.trim());
@@ -251,17 +313,18 @@ function renderGroupedMessage(
     .filter(Boolean)
     .join(" ");
 
-  if (!markdown && hasToolCards && isToolResult) {
+  if (!markdown && !hasAudio && hasToolCards && isToolResult) {
     return html`${toolCards.map((card) => renderToolCardSidebar(card, onOpenSidebar))}`;
   }
 
-  if (!markdown && !hasToolCards && !hasImages) {
+  if (!markdown && !hasToolCards && !hasImages && !hasAudio) {
     return nothing;
   }
 
   return html`
     <div class="${bubbleClasses}">
       ${canCopyMarkdown ? renderCopyAsMarkdownButton(markdown!) : nothing}
+      ${renderMessageAudio(audioBlocks)}
       ${renderMessageImages(images)}
       ${
         reasoningMarkdown

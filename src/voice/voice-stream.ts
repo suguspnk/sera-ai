@@ -148,13 +148,12 @@ async function streamTTSToClient(
         // Convert Uint8Array to Buffer and log first samples
         const buf = Buffer.from(value);
         if (totalBytes === 0 && buf.length >= 20) {
-          const samples = [];
-          for (let i = 0; i < 20; i += 2) {
-            samples.push(buf.readInt16LE(i));
-          }
-          logVerbose(`First chunk ${buf.length} bytes, first 10 samples: [${samples.join(", ")}]`);
+          // Log raw bytes for debugging
+          const rawBytes = Array.from(buf.slice(0, 20));
+          logVerbose(`Sending first chunk ${buf.length} bytes, raw first 20: [${rawBytes.join(", ")}]`);
         }
-        session.clientWs.send(buf);
+        // Explicitly send as binary frame
+        session.clientWs.send(buf, { binary: true });
         totalBytes += buf.length;
       }
     }
