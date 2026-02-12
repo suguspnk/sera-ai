@@ -3,7 +3,7 @@
  *
  * This module provides:
  * - WebSocket-based voice streaming endpoint
- * - Integration with Kokoro TTS for streaming audio
+ * - Integration with Piper TTS for streaming audio (22050 Hz, 16-bit PCM)
  * - VAD (Voice Activity Detection) for turn management
  * - Barge-in support (interrupt when user speaks)
  */
@@ -17,13 +17,12 @@ import { logVerbose } from "../globals.js";
 const logWarn = (msg: string) => console.warn(`[voice] ${msg}`);
 const logError = (msg: string) => console.error(`[voice] ${msg}`);
 
-const KOKORO_WS_URL = process.env.KOKORO_WS_URL || "ws://127.0.0.1:8766/ws/tts";
-const KOKORO_STREAM_URL =
-  process.env.KOKORO_STREAM_URL || "http://127.0.0.1:8766/v1/audio/speech/stream";
+// Piper TTS server URL (default port 8767)
+const PIPER_STREAM_URL =
+  process.env.PIPER_STREAM_URL || "http://127.0.0.1:8767/v1/audio/speech/stream";
 
 export interface VoiceStreamConfig {
-  kokoroWsUrl: string;
-  kokoroStreamUrl: string;
+  piperStreamUrl: string;
   defaultVoice: string;
   sampleRate: number;
 }
@@ -31,7 +30,6 @@ export interface VoiceStreamConfig {
 export interface VoiceSession {
   id: string;
   clientWs: WebSocket;
-  kokoroWs: WebSocket | null;
   isGenerating: boolean;
   shouldInterrupt: boolean;
   voice: string;
@@ -57,12 +55,10 @@ const activeSessions = new Map<string, VoiceSession>();
  * Get default voice configuration.
  */
 export function getVoiceConfig(cfg?: OpenClawConfig): VoiceStreamConfig {
-  const ttsConfig = cfg?.messages?.tts;
   return {
-    kokoroWsUrl: KOKORO_WS_URL,
-    kokoroStreamUrl: KOKORO_STREAM_URL,
-    defaultVoice: (ttsConfig as any)?.openai?.voice || "bf_isabella",
-    sampleRate: 24000,
+    piperStreamUrl: PIPER_STREAM_URL,
+    defaultVoice: "en_US-ryan-medium",
+    sampleRate: 22050,
   };
 }
 
@@ -74,10 +70,9 @@ function createSession(clientWs: WebSocket): VoiceSession {
   const session: VoiceSession = {
     id,
     clientWs,
-    kokoroWs: null,
     isGenerating: false,
     shouldInterrupt: false,
-    voice: "bf_isabella",
+    voice: "en_US-ryan-medium",
     createdAt: Date.now(),
   };
   activeSessions.set(id, session);
@@ -89,13 +84,12 @@ function createSession(clientWs: WebSocket): VoiceSession {
  * Destroy a voice session.
  */
 function destroySession(session: VoiceSession): void {
-  session.kokoroWs?.close();
   activeSessions.delete(session.id);
   logVerbose(`Voice session destroyed: ${session.id}`);
 }
 
 /**
- * Stream TTS audio to client via HTTP streaming.
+ * Stream TTS audio to client via HTTP streaming (Piper).
  */
 async function streamTTSToClient(
   session: VoiceSession,
@@ -114,14 +108,14 @@ async function streamTTSToClient(
     // Notify client that audio is starting
     sendToClient(session, { type: "audio_start", voice });
 
-    const response = await fetch(config.kokoroStreamUrl, {
+    const response = await fetch(config.piperStreamUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, voice, speed: 1.0 }),
     });
 
     if (!response.ok) {
-      throw new Error(`Kokoro stream error: ${response.status}`);
+      throw new Error(`Piper stream error: ${response.status}`);
     }
 
     if (!response.body) {
@@ -130,6 +124,7 @@ async function streamTTSToClient(
 
     const reader = response.body.getReader();
     let totalBytes = 0;
+    let leftoverByte: number | null = null; // Buffer for odd-byte alignment
 
     while (true) {
       if (session.shouldInterrupt) {
@@ -140,21 +135,43 @@ async function streamTTSToClient(
 
       const { done, value } = await reader.read();
       if (done) {
+        // Send any remaining leftover byte (shouldn't happen with valid audio)
+        if (leftoverByte !== null) {
+          logWarn(`Audio stream ended with leftover byte - this shouldn't happen`);
+        }
         break;
       }
 
+      // Build chunk with proper 16-bit alignment
+      let chunk: Buffer;
+      if (leftoverByte !== null) {
+        // Prepend leftover byte from previous chunk
+        chunk = Buffer.alloc(1 + value.length);
+        chunk[0] = leftoverByte;
+        chunk.set(value, 1);
+        leftoverByte = null;
+      } else {
+        chunk = Buffer.from(value);
+      }
+
+      // Ensure even byte count for 16-bit audio alignment
+      if (chunk.length % 2 !== 0) {
+        leftoverByte = chunk[chunk.length - 1];
+        chunk = chunk.subarray(0, chunk.length - 1);
+      }
+
       // Send audio chunk as binary
-      if (session.clientWs.readyState === WebSocket.OPEN) {
-        // Convert Uint8Array to Buffer and log first samples
-        const buf = Buffer.from(value);
-        if (totalBytes === 0 && buf.length >= 20) {
-          // Log raw bytes for debugging
-          const rawBytes = Array.from(buf.slice(0, 20));
-          logVerbose(`Sending first chunk ${buf.length} bytes, raw first 20: [${rawBytes.join(", ")}]`);
-        }
+      if (session.clientWs.readyState === WebSocket.OPEN && chunk.length > 0) {
+        // Log ALL chunks for debugging the zero-byte issue
+        const rawBytes = Array.from(chunk.slice(0, Math.min(20, chunk.length)));
+        const isAllZeros = rawBytes.every((b) => b === 0);
+        console.log(
+          `[voice] Sending chunk #${Math.floor(totalBytes / 65536) + 1}: ${chunk.length} bytes, ` +
+            `allZeros=${isAllZeros}, first 20: [${rawBytes.join(", ")}]`,
+        );
         // Explicitly send as binary frame
-        session.clientWs.send(buf, { binary: true });
-        totalBytes += buf.length;
+        session.clientWs.send(chunk, { binary: true });
+        totalBytes += chunk.length;
       }
     }
 
@@ -169,83 +186,6 @@ async function streamTTSToClient(
     session.isGenerating = false;
     session.shouldInterrupt = false;
   }
-}
-
-/**
- * Stream TTS using WebSocket connection to Kokoro.
- */
-async function streamTTSViaWebSocket(
-  session: VoiceSession,
-  text: string,
-  config: VoiceStreamConfig,
-): Promise<void> {
-  if (session.shouldInterrupt) {
-    logVerbose(`TTS interrupted before start: ${session.id}`);
-    return;
-  }
-
-  session.isGenerating = true;
-  const voice = session.voice || config.defaultVoice;
-
-  return new Promise((resolve, reject) => {
-    try {
-      const kokoroWs = new WebSocket(config.kokoroWsUrl);
-      session.kokoroWs = kokoroWs;
-
-      kokoroWs.on("open", () => {
-        logVerbose(`Kokoro WS connected for session: ${session.id}`);
-        sendToClient(session, { type: "audio_start", voice });
-        kokoroWs.send(JSON.stringify({ text, voice, speed: 1.0 }));
-      });
-
-      kokoroWs.on("message", (data: RawData, isBinary: boolean) => {
-        if (session.shouldInterrupt) {
-          logVerbose(`TTS interrupted, closing Kokoro WS: ${session.id}`);
-          kokoroWs.close();
-          return;
-        }
-
-        if (isBinary) {
-          // Forward audio chunk to client
-          if (session.clientWs.readyState === WebSocket.OPEN) {
-            session.clientWs.send(data);
-          }
-        } else {
-          // JSON message (completion or error)
-          try {
-            const msg = JSON.parse(data.toString());
-            if (msg.done) {
-              sendToClient(session, { type: "audio_end", duration: msg.duration });
-              kokoroWs.close();
-            } else if (msg.error) {
-              sendToClient(session, { type: "error", message: msg.error });
-              kokoroWs.close();
-            }
-          } catch (e) {
-            logWarn(`Failed to parse Kokoro message: ${data.toString()}`);
-          }
-        }
-      });
-
-      kokoroWs.on("close", () => {
-        session.kokoroWs = null;
-        session.isGenerating = false;
-        session.shouldInterrupt = false;
-        resolve();
-      });
-
-      kokoroWs.on("error", (error) => {
-        logError(`Kokoro WS error: ${error.message}`);
-        sendToClient(session, { type: "error", message: error.message });
-        session.kokoroWs = null;
-        session.isGenerating = false;
-        reject(error);
-      });
-    } catch (error) {
-      session.isGenerating = false;
-      reject(error);
-    }
-  });
 }
 
 /**
@@ -306,7 +246,6 @@ async function handleClientMessage(
       case "interrupt":
         if (session.isGenerating) {
           session.shouldInterrupt = true;
-          session.kokoroWs?.close();
           logVerbose(`Interrupt requested for session: ${session.id}`);
         }
         break;
