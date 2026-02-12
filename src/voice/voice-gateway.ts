@@ -47,7 +47,7 @@ async function callGatewayLLM(
         {
           role: "system" as const,
           content:
-            "You are a helpful voice assistant. Keep responses concise and conversational, suitable for spoken delivery. Aim for 1-3 sentences unless more detail is explicitly requested.",
+            "You are a helpful voice assistant. Keep responses concise and conversational, suitable for spoken delivery. Aim for 1-3 sentences unless more detail is explicitly requested. Do not use markdown formatting (no asterisks, underscores, or backticks) as your responses will be spoken aloud.",
         },
       ];
       conversationHistory.set(voiceSessionId, history);

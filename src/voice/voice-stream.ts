@@ -89,6 +89,30 @@ function destroySession(session: VoiceSession): void {
 }
 
 /**
+ * Strip markdown formatting for TTS.
+ * Removes asterisks, underscores, backticks, etc. that would be spoken literally.
+ */
+function stripMarkdownForTTS(text: string): string {
+  return text
+    // Remove bold/italic markers: **text**, *text*, __text__, _text_
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/_([^_]+)_/g, "$1")
+    // Remove inline code: `text`
+    .replace(/`([^`]+)`/g, "$1")
+    // Remove strikethrough: ~~text~~
+    .replace(/~~([^~]+)~~/g, "$1")
+    // Remove markdown links: [text](url) → text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    // Remove standalone asterisks/underscores
+    .replace(/[*_~`]/g, "")
+    // Clean up extra whitespace
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
  * Stream TTS audio to client via HTTP streaming (Piper).
  */
 async function streamTTSToClient(
@@ -103,6 +127,9 @@ async function streamTTSToClient(
 
   session.isGenerating = true;
   const voice = session.voice || config.defaultVoice;
+  
+  // Strip markdown for clean TTS
+  const ttsText = stripMarkdownForTTS(text);
 
   try {
     // Notify client that audio is starting
@@ -111,7 +138,7 @@ async function streamTTSToClient(
     const response = await fetch(config.piperStreamUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, voice, speed: 1.0 }),
+      body: JSON.stringify({ text: ttsText, voice, speed: 1.0 }),
     });
 
     if (!response.ok) {
