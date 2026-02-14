@@ -1,0 +1,20 @@
+{
+  "name": "@openclaw/piper-server",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible TTS server using Piper",
+  "bin": {
+    "piper-server": "./server.js"
+  },
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "install-voice": "node install-voice.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "fastify": "^5.7.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

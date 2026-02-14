@@ -1,0 +1,15 @@
+[Unit]
+Description=Piper TTS Server (OpenAI-compatible)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env node %h/projects/sera-ai/scripts/piper-server/server.js
+WorkingDirectory=%h/projects/sera-ai/scripts/piper-server
+Environment=PORT=8767
+Environment=PIPER_VOICES_DIR=%h/.local/share/piper-voices
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
